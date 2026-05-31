@@ -1,3 +1,5 @@
+import os
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -145,5 +147,17 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(buttons))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+web = Flask(__name__)
+
+@web.route("/")
+def home():
+    return "Bot is alive!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    web.run(host="0.0.0.0", port=port)
+
+Thread(target=run_web, daemon=True).start()
 
 app.run_polling()
