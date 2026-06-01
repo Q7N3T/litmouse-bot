@@ -165,7 +165,13 @@ async def error_handler(update, context):
 
 app.add_error_handler(error_handler)
 
-app.run_polling(
-    drop_pending_updates=True,
-    allowed_updates=Update.ALL_TYPES
-)
+print("BOT STARTING...")
+
+try:
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
+except Exception as e:
+    print(f"BOT CRASHED: {e}")
+    raise
