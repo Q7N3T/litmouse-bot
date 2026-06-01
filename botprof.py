@@ -160,4 +160,12 @@ def run_web():
 
 Thread(target=run_web, daemon=True).start()
 
-app.run_polling()
+async def error_handler(update, context):
+    print(f"ERROR: {context.error}")
+
+app.add_error_handler(error_handler)
+
+app.run_polling(
+    drop_pending_updates=True,
+    allowed_updates=Update.ALL_TYPES
+)
