@@ -24,6 +24,7 @@ ADMIN_IDS = {804851530, 5242178843}
 CHANNEL_USERNAME = "@litmouseee"
 DB_PATH = os.environ.get("STATS_DB_PATH", "bot_stats.db")
 ANON_COOLDOWN_SECONDS = 180
+START_DEDUPE_SECONDS = 10
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
@@ -92,6 +93,33 @@ def track_event(user_id, event_type, payload=None):
             """,
             (user_id, event_type, payload)
         )
+
+
+def should_send_start_response(user_id):
+    with sqlite3.connect(DB_PATH) as connection:
+        elapsed = connection.execute(
+            """
+            SELECT
+                CAST(strftime('%s', 'now') AS INTEGER)
+                - CAST(strftime('%s', MAX(created_at)) AS INTEGER)
+            FROM events
+            WHERE user_id = ? AND event_type = 'start_response'
+            """,
+            (user_id,)
+        ).fetchone()[0]
+
+        if elapsed is not None and elapsed < START_DEDUPE_SECONDS:
+            return False
+
+        connection.execute(
+            """
+            INSERT INTO events (user_id, event_type)
+            VALUES (?, 'start_response')
+            """,
+            (user_id,)
+        )
+
+    return True
 
 
 def get_all_user_ids():
@@ -248,6 +276,11 @@ async def send_message_to_admins(context, user_id, text, title):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user)
+
+    if not should_send_start_response(update.effective_user.id):
+        track_event(update.effective_user.id, "start_duplicate_ignored")
+        return
+
     track_event(update.effective_user.id, "start")
 
     with open("navigation.jpg", "rb") as photo:
