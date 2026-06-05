@@ -25,6 +25,7 @@ CHANNEL_USERNAME = "@litmouseee"
 DB_PATH = os.environ.get("STATS_DB_PATH", "bot_stats.db")
 ANON_COOLDOWN_SECONDS = 180
 START_DEDUPE_SECONDS = 10
+CALLBACK_DEDUPE_SECONDS = 5
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
@@ -117,6 +118,35 @@ def should_send_start_response(user_id):
             VALUES (?, 'start_response')
             """,
             (user_id,)
+        )
+
+    return True
+
+
+def should_handle_callback(user_id, callback_data):
+    with sqlite3.connect(DB_PATH) as connection:
+        elapsed = connection.execute(
+            """
+            SELECT
+                CAST(strftime('%s', 'now') AS INTEGER)
+                - CAST(strftime('%s', MAX(created_at)) AS INTEGER)
+            FROM events
+            WHERE user_id = ?
+                AND event_type = 'callback_handled'
+                AND payload = ?
+            """,
+            (user_id, callback_data)
+        ).fetchone()[0]
+
+        if elapsed is not None and elapsed < CALLBACK_DEDUPE_SECONDS:
+            return False
+
+        connection.execute(
+            """
+            INSERT INTO events (user_id, event_type, payload)
+            VALUES (?, 'callback_handled', ?)
+            """,
+            (user_id, callback_data)
         )
 
     return True
@@ -309,6 +339,10 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     track_user(query.from_user)
+
+    if not should_handle_callback(query.from_user.id, query.data):
+        track_event(query.from_user.id, "callback_duplicate_ignored", query.data)
+        return
 
     if query.data.startswith("reply:"):
         if not is_admin(query.from_user.id):
