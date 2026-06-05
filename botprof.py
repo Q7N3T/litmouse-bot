@@ -15,6 +15,8 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from flask import Flask
+from threading import Thread
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = {804851530, 5242178843}
@@ -992,6 +994,19 @@ app.add_handler(CallbackQueryHandler(buttons))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+web = Flask(__name__)
+
+
+@web.route("/")
+def home():
+    return "Bot is alive!"
+
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    web.run(host="0.0.0.0", port=port)
+
+
 async def error_handler(update, context):
     print(f"ERROR: {context.error}")
 
@@ -1015,6 +1030,7 @@ try:
         )
     else:
         print("POLLING MODE")
+        Thread(target=run_web, daemon=True).start()
         app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES
