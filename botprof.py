@@ -16,22 +16,30 @@ from telegram.ext import (
     filters
 )
 
-from flask import Flask
-from threading import Thread
-
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = {804851530, 5242178843}
 CHANNEL_USERNAME = "@litmouseee"
-DB_PATH = os.environ.get("STATS_DB_PATH", "bot_stats.db")
+DEFAULT_DB_PATH = "/var/data/bot_stats.db"
+DB_PATH = os.environ.get(
+    "STATS_DB_PATH",
+    DEFAULT_DB_PATH if os.path.isdir("/var/data") else "bot_stats.db"
+)
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "telegram")
 ANON_COOLDOWN_SECONDS = 180
 START_DEDUPE_SECONDS = 10
 CALLBACK_DEDUPE_SECONDS = 5
+TULA_FILE_ID = "BQACAgIAAxkBAAN4ahyiUiuQiVF7dj7qZeUBm_g4wzMAAqWiAAIw2-FIbVOmu_AIVo47BA"
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
 
 
 def init_db():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -52,6 +60,49 @@ def init_db():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS guides (
+                city_key TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                file_id TEXT,
+                is_available INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 100,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_user_type_payload_created
+            ON events (user_id, event_type, payload, created_at)
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_type_created
+            ON events (event_type, created_at)
+        """)
+        seed_guides(connection)
+
+
+def seed_guides(connection):
+    default_guides = [
+        ("tula", "📍 Тула", TULA_FILE_ID, 1, 10),
+        ("paris", "🇫🇷 Париж", None, 0, 20),
+        ("barcelona", "🇪🇸 Барселона", None, 0, 30),
+    ]
+
+    for city_key, title, file_id, is_available, sort_order in default_guides:
+        connection.execute(
+            """
+            INSERT INTO guides (
+                city_key,
+                title,
+                file_id,
+                is_available,
+                sort_order
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(city_key) DO NOTHING
+            """,
+            (city_key, title, file_id, is_available, sort_order)
+        )
 
 
 def track_user(user):
@@ -161,6 +212,91 @@ def get_all_user_ids():
     return [row[0] for row in rows]
 
 
+def get_guides():
+    with sqlite3.connect(DB_PATH) as connection:
+        rows = connection.execute(
+            """
+            SELECT city_key, title, file_id, is_available
+            FROM guides
+            ORDER BY sort_order, title
+            """
+        ).fetchall()
+
+    return [
+        {
+            "city_key": row[0],
+            "title": row[1],
+            "file_id": row[2],
+            "is_available": bool(row[3]),
+        }
+        for row in rows
+    ]
+
+
+def get_guide(city_key):
+    with sqlite3.connect(DB_PATH) as connection:
+        row = connection.execute(
+            """
+            SELECT city_key, title, file_id, is_available
+            FROM guides
+            WHERE city_key = ?
+            """,
+            (city_key,)
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "city_key": row[0],
+        "title": row[1],
+        "file_id": row[2],
+        "is_available": bool(row[3]),
+    }
+
+
+def save_guide(city_key, title, file_id):
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO guides (
+                city_key,
+                title,
+                file_id,
+                is_available,
+                updated_at
+            )
+            VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(city_key) DO UPDATE SET
+                title = excluded.title,
+                file_id = excluded.file_id,
+                is_available = 1,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (city_key, title, file_id)
+        )
+
+
+def recent_questions(limit=10):
+    with sqlite3.connect(DB_PATH) as connection:
+        rows = connection.execute(
+            """
+            SELECT event_type, payload, created_at
+            FROM events
+            WHERE event_type IN (
+                'anonymous_question',
+                'anonymous_dialog_reply'
+            )
+                AND payload IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+    return rows
+
+
 def count_events(connection, event_type, payload=None):
     if payload is None:
         return connection.execute(
@@ -265,6 +401,28 @@ def stats_text():
     )
 
 
+def questions_text():
+    rows = recent_questions()
+
+    if not rows:
+        return "Пока нет сохранённых анонимных вопросов."
+
+    lines = ["Последние анонимные сообщения:"]
+
+    for index, (event_type, payload, created_at) in enumerate(rows, start=1):
+        title = "Вопрос"
+        if event_type == "anonymous_dialog_reply":
+            title = "Продолжение"
+
+        text = payload.strip()
+        if len(text) > 300:
+            text = f"{text[:300]}..."
+
+        lines.append(f"\n{index}. {title} · {created_at}\n{text}")
+
+    return "\n".join(lines)
+
+
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("❓ Задать анонимный вопрос", callback_data="anon")],
@@ -277,10 +435,30 @@ def main_menu():
 def admin_menu():
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("🗂 Гайды", callback_data="admin_guides_help")],
+        [InlineKeyboardButton("❓ Вопросы", callback_data="admin_questions")],
         [InlineKeyboardButton("📣 Рассылка", callback_data="admin_broadcast_help")],
         [InlineKeyboardButton("🛠 Команды", callback_data="admin_help")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def guides_menu():
+    keyboard = []
+
+    for guide in get_guides():
+        title = guide["title"]
+        if not guide["is_available"]:
+            title = f"{title} (скоро)"
+
+        keyboard.append([
+            InlineKeyboardButton(
+                title,
+                callback_data=f"city_{guide['city_key']}"
+            )
+        ])
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -383,6 +561,27 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Бот покажет предпросмотр и попросит подтвердить отправку."
         )
 
+    elif query.data == "admin_guides_help":
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        await query.message.reply_text(
+            "🗂 Управление гайдами\n\n"
+            "Чтобы добавить или заменить гайд:\n"
+            "/addguide city_key Название города\n\n"
+            "Пример:\n"
+            "/addguide paris 🇫🇷 Париж\n\n"
+            "После команды отправь PDF или другой файл следующим сообщением."
+        )
+
+    elif query.data == "admin_questions":
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        await query.message.reply_text(questions_text())
+
     elif query.data == "broadcast_confirm":
         if not is_admin(query.from_user.id):
             await query.message.reply_text("Эта кнопка доступна только админу.")
@@ -437,6 +636,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/admin — открыть админ-меню\n"
             "/stats — показать статистику\n"
             "/broadcast текст — сделать рассылку всем пользователям\n"
+            "/addguide city_key Название — добавить или заменить гайд\n"
+            "/questions — последние анонимные вопросы\n"
             "/cancel — отменить текущий ответ или ввод вопроса\n\n"
             "Чтобы ответить на анонимный вопрос, нажми кнопку "
             "«Ответить» под сообщением с вопросом."
@@ -464,15 +665,9 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if is_subscribed:
-            keyboard = [
-                [InlineKeyboardButton("📍 Тула", callback_data="city_tula")],
-                [InlineKeyboardButton("🇫🇷 Париж (скоро)", callback_data="city_paris")],
-                [InlineKeyboardButton("🇪🇸 Барселона (скоро)", callback_data="city_barcelona")]
-            ]
-
             await query.message.reply_text(
                 "Выберите город:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                reply_markup=guides_menu()
             )
         else:
             keyboard = [
@@ -491,20 +686,25 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
-    elif query.data == "city_tula":
-        track_event(query.from_user.id, "guide_download", "tula")
+    elif query.data.startswith("city_"):
+        city_key = query.data.removeprefix("city_")
+        guide = get_guide(city_key)
+
+        if not guide:
+            await query.message.reply_text("Этот гайд не найден.")
+            return
+
+        if not guide["is_available"] or not guide["file_id"]:
+            track_event(query.from_user.id, "coming_soon_guide_clicked", city_key)
+            await query.message.reply_text("✨ Этот гайд скоро появится.")
+            return
+
+        track_event(query.from_user.id, "guide_download", city_key)
 
         await context.bot.send_document(
             chat_id=query.from_user.id,
-            document="BQACAgIAAxkBAAN4ahyiUiuQiVF7dj7qZeUBm_g4wzMAAqWiAAIw2-FIbVOmu_AIVo47BA",
-            caption="📍 Гайд по Туле"
-        )
-
-    elif query.data in ["city_paris", "city_barcelona"]:
-        city = query.data.removeprefix("city_")
-        track_event(query.from_user.id, "coming_soon_guide_clicked", city)
-        await query.message.reply_text(
-            "✨ Этот гайд скоро появится."
+            document=guide["file_id"],
+            caption=f"{guide['title']}"
         )
 
     elif query.data == "social":
@@ -579,7 +779,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["anon_dialog_mode"] = False
-        track_event(update.effective_user.id, "anonymous_dialog_reply")
+        track_event(
+            update.effective_user.id,
+            "anonymous_dialog_reply",
+            update.message.text
+        )
 
         await update.message.reply_text("Ответ отправлен анонимно ✅")
         return
@@ -611,7 +815,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["anon_mode"] = False
-        track_event(update.effective_user.id, "anonymous_question")
+        track_event(
+            update.effective_user.id,
+            "anonymous_question",
+            update.message.text
+        )
 
         await update.message.reply_text(
             "Вопрос отправлен анонимно ✅"
@@ -674,10 +882,95 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def add_guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update.effective_user)
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+
+    _, _, rest = update.message.text.partition(" ")
+    parts = rest.strip().split(maxsplit=1)
+
+    if len(parts) != 2:
+        await update.message.reply_text(
+            "Используй формат:\n"
+            "/addguide city_key Название города\n\n"
+            "Пример:\n"
+            "/addguide paris 🇫🇷 Париж"
+        )
+        return
+
+    city_key, title = parts
+    city_key = city_key.lower().strip()
+
+    if not city_key.replace("_", "").replace("-", "").isalnum():
+        await update.message.reply_text(
+            "city_key должен состоять из латинских букв, цифр, "
+            "дефиса или подчёркивания."
+        )
+        return
+
+    context.user_data["pending_guide"] = {
+        "city_key": city_key,
+        "title": title.strip(),
+    }
+
+    await update.message.reply_text(
+        f"Теперь отправь файл для гайда: {title.strip()}.\n\n"
+        "Чтобы отменить, отправь /cancel."
+    )
+
+
+async def questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update.effective_user)
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+
+    await update.message.reply_text(questions_text())
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update.effective_user)
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    pending_guide = context.user_data.get("pending_guide")
+    if not pending_guide:
+        await update.message.reply_text(
+            "Если это файл гайда, сначала отправь:\n"
+            "/addguide city_key Название города"
+        )
+        return
+
+    document = update.message.document
+    save_guide(
+        pending_guide["city_key"],
+        pending_guide["title"],
+        document.file_id
+    )
+    context.user_data.pop("pending_guide", None)
+    track_event(
+        update.effective_user.id,
+        "guide_saved",
+        pending_guide["city_key"]
+    )
+
+    await update.message.reply_text(
+        "Гайд сохранён ✅\n\n"
+        f"Город: {pending_guide['title']}\n"
+        f"Ключ: {pending_guide['city_key']}"
+    )
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user)
     context.user_data.pop("reply_to_user_id", None)
     context.user_data.pop("broadcast_text", None)
+    context.user_data.pop("pending_guide", None)
     context.user_data["anon_mode"] = False
     context.user_data["anon_dialog_mode"] = False
 
@@ -692,21 +985,12 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin))
 app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("broadcast", broadcast))
+app.add_handler(CommandHandler("addguide", add_guide))
+app.add_handler(CommandHandler("questions", questions))
 app.add_handler(CommandHandler("cancel", cancel))
 app.add_handler(CallbackQueryHandler(buttons))
+app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-web = Flask(__name__)
-
-@web.route("/")
-def home():
-    return "Bot is alive!"
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    web.run(host="0.0.0.0", port=port)
-
-Thread(target=run_web, daemon=True).start()
 
 async def error_handler(update, context):
     print(f"ERROR: {context.error}")
@@ -716,10 +1000,25 @@ app.add_error_handler(error_handler)
 print("BOT STARTING...")
 
 try:
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    if WEBHOOK_URL:
+        port = int(os.environ.get("PORT", 10000))
+        webhook_url = f"{WEBHOOK_URL.rstrip('/')}/{WEBHOOK_PATH}"
+        print(f"WEBHOOK MODE: {webhook_url}")
+
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=WEBHOOK_PATH,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
+    else:
+        print("POLLING MODE")
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
 except Exception as e:
     print(f"BOT CRASHED: {e}")
     raise
