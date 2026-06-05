@@ -19,11 +19,14 @@ from telegram.ext import (
 from flask import Flask
 from threading import Thread
 
-TOKEN = "8292292452:AAF31xt5WbIz3KyPzgx2KwS77DfkxGh-jl4"
+TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = {804851530, 5242178843}
 CHANNEL_USERNAME = "@litmouseee"
 DB_PATH = os.environ.get("STATS_DB_PATH", "bot_stats.db")
 ANON_COOLDOWN_SECONDS = 180
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is required")
 
 
 def init_db():
@@ -91,6 +94,15 @@ def track_event(user_id, event_type, payload=None):
         )
 
 
+def get_all_user_ids():
+    with sqlite3.connect(DB_PATH) as connection:
+        rows = connection.execute(
+            "SELECT user_id FROM users ORDER BY first_seen"
+        ).fetchall()
+
+    return [row[0] for row in rows]
+
+
 def count_events(connection, event_type, payload=None):
     if payload is None:
         return connection.execute(
@@ -136,6 +148,7 @@ def get_stats():
                 connection,
                 "anonymous_rate_limited"
             ),
+            "broadcasts": count_events(connection, "broadcast_sent"),
             "guides_opened": count_events(connection, "guides_opened"),
             "tula_downloads": count_events(connection, "guide_download", "tula"),
             "tula_users": tula_users,
@@ -186,6 +199,7 @@ def stats_text():
         f"Продолжений диалога: {data['anonymous_dialog_replies']}\n"
         f"Ответов админов: {data['anonymous_replies']}\n"
         f"Сработок антиспама: {data['anonymous_rate_limited']}\n\n"
+        f"Рассылок: {data['broadcasts']}\n\n"
         f"Открытий гайдов: {data['guides_opened']}\n"
         f"Скачиваний Тулы: {data['tula_downloads']}\n"
         f"Уникальных скачавших Тулу: {data['tula_users']}\n\n"
@@ -205,6 +219,7 @@ def main_menu():
 def admin_menu():
     keyboard = [
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("📣 Рассылка", callback_data="admin_broadcast_help")],
         [InlineKeyboardButton("🛠 Команды", callback_data="admin_help")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
     ]
@@ -289,6 +304,62 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(stats_text())
 
+    elif query.data == "admin_broadcast_help":
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        await query.message.reply_text(
+            "📣 Рассылка\n\n"
+            "Отправь команду:\n"
+            "/broadcast текст сообщения\n\n"
+            "Бот покажет предпросмотр и попросит подтвердить отправку."
+        )
+
+    elif query.data == "broadcast_confirm":
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        text = context.user_data.pop("broadcast_text", None)
+        if not text:
+            await query.message.reply_text(
+                "Черновик рассылки не найден. Отправь /broadcast заново."
+            )
+            return
+
+        users = get_all_user_ids()
+        sent_count = 0
+        failed_count = 0
+
+        for user_id in users:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text)
+                sent_count += 1
+            except Exception as error:
+                failed_count += 1
+                print(f"BROADCAST FAILED for {user_id}: {error}")
+
+        track_event(
+            query.from_user.id,
+            "broadcast_sent",
+            f"sent={sent_count};failed={failed_count}"
+        )
+
+        await query.message.reply_text(
+            "Рассылка завершена.\n\n"
+            f"Отправлено: {sent_count}\n"
+            f"Ошибок: {failed_count}"
+        )
+
+    elif query.data == "broadcast_cancel":
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        context.user_data.pop("broadcast_text", None)
+        await query.message.reply_text("Рассылка отменена.")
+
     elif query.data == "admin_help":
         if not is_admin(query.from_user.id):
             await query.message.reply_text("Эта кнопка доступна только админу.")
@@ -298,6 +369,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🛠 Админ-команды\n\n"
             "/admin — открыть админ-меню\n"
             "/stats — показать статистику\n"
+            "/broadcast текст — сделать рассылку всем пользователям\n"
             "/cancel — отменить текущий ответ или ввод вопроса\n\n"
             "Чтобы ответить на анонимный вопрос, нажми кнопку "
             "«Ответить» под сообщением с вопросом."
@@ -502,9 +574,43 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update.effective_user)
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text(
+            "Напиши текст рассылки после команды.\n\n"
+            "Пример:\n"
+            "/broadcast Новый гайд уже в боте"
+        )
+        return
+
+    context.user_data["broadcast_text"] = text
+    users_count = len(get_all_user_ids())
+    keyboard = [
+        [
+            InlineKeyboardButton("Отправить", callback_data="broadcast_confirm"),
+            InlineKeyboardButton("Отменить", callback_data="broadcast_cancel")
+        ]
+    ]
+
+    await update.message.reply_text(
+        "Предпросмотр рассылки:\n\n"
+        f"{text}\n\n"
+        f"Получателей в базе: {users_count}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user)
     context.user_data.pop("reply_to_user_id", None)
+    context.user_data.pop("broadcast_text", None)
     context.user_data["anon_mode"] = False
     context.user_data["anon_dialog_mode"] = False
 
@@ -518,6 +624,7 @@ app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("admin", admin))
 app.add_handler(CommandHandler("stats", stats))
+app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CommandHandler("cancel", cancel))
 app.add_handler(CallbackQueryHandler(buttons))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
