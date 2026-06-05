@@ -59,7 +59,19 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "anon":
+    if query.data.startswith("reply:"):
+        if query.from_user.id != ADMIN_ID:
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        user_id = int(query.data.split(":", 1)[1])
+        context.user_data["reply_to_user_id"] = user_id
+        await query.message.reply_text(
+            "Напиши ответ — бот отправит его пользователю анонимно.\n\n"
+            "Чтобы отменить ответ, отправь /cancel."
+        )
+
+    elif query.data == "anon":
         context.user_data["anon_mode"] = True
         await query.message.reply_text(
             "Напиши свой вопрос — он будет отправлен анонимно."
@@ -126,12 +138,40 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if (
+        update.effective_user.id == ADMIN_ID
+        and context.user_data.get("reply_to_user_id")
+    ):
+        user_id = context.user_data.pop("reply_to_user_id")
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"💌 Ответ на твой анонимный вопрос:\n\n{update.message.text}"
+            )
+        except Exception as error:
+            await update.message.reply_text(
+                f"Не получилось отправить ответ: {error}"
+            )
+            return
+
+        await update.message.reply_text("Ответ отправлен ✅")
+        return
+
     if context.user_data.get("anon_mode"):
         text = update.message.text
 
+        keyboard = [
+            [InlineKeyboardButton(
+                "Ответить",
+                callback_data=f"reply:{update.effective_chat.id}"
+            )]
+        ]
+
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"❓ Анонимный вопрос:\n\n{text}"
+            text=f"❓ Анонимный вопрос:\n\n{text}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
         context.user_data["anon_mode"] = False
@@ -141,10 +181,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("reply_to_user_id", None)
+    context.user_data["anon_mode"] = False
+
+    await update.message.reply_text("Действие отменено.")
+
+
 
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("cancel", cancel))
 app.add_handler(CallbackQueryHandler(buttons))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
