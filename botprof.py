@@ -23,6 +23,7 @@ TOKEN = "8292292452:AAF31xt5WbIz3KyPzgx2KwS77DfkxGh-jl4"
 ADMIN_IDS = {804851530, 5242178843}
 CHANNEL_USERNAME = "@litmouseee"
 DB_PATH = os.environ.get("STATS_DB_PATH", "bot_stats.db")
+ANON_COOLDOWN_SECONDS = 180
 
 
 def init_db():
@@ -126,7 +127,15 @@ def get_stats():
             "active_today": active_today,
             "starts": count_events(connection, "start"),
             "anonymous_questions": count_events(connection, "anonymous_question"),
+            "anonymous_dialog_replies": count_events(
+                connection,
+                "anonymous_dialog_reply"
+            ),
             "anonymous_replies": count_events(connection, "anonymous_reply"),
+            "anonymous_rate_limited": count_events(
+                connection,
+                "anonymous_rate_limited"
+            ),
             "guides_opened": count_events(connection, "guides_opened"),
             "tula_downloads": count_events(connection, "guide_download", "tula"),
             "tula_users": tula_users,
@@ -138,6 +147,52 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
+def get_anon_wait_seconds(user_id):
+    with sqlite3.connect(DB_PATH) as connection:
+        elapsed = connection.execute(
+            """
+            SELECT
+                CAST(strftime('%s', 'now') AS INTEGER)
+                - CAST(strftime('%s', MAX(created_at)) AS INTEGER)
+            FROM events
+            WHERE user_id = ?
+                AND event_type IN (
+                    'anonymous_question',
+                    'anonymous_dialog_reply'
+                )
+            """,
+            (user_id,)
+        ).fetchone()[0]
+
+    if elapsed is None or elapsed >= ANON_COOLDOWN_SECONDS:
+        return 0
+
+    return ANON_COOLDOWN_SECONDS - elapsed
+
+
+def format_wait_time(seconds):
+    minutes = max(1, (seconds + 59) // 60)
+    return f"{minutes} мин."
+
+
+def stats_text():
+    data = get_stats()
+    return (
+        "📊 Статистика бота\n\n"
+        f"Пользователей: {data['users']}\n"
+        f"Активных сегодня (МСК): {data['active_today']}\n"
+        f"Запусков /start: {data['starts']}\n\n"
+        f"Анонимных вопросов: {data['anonymous_questions']}\n"
+        f"Продолжений диалога: {data['anonymous_dialog_replies']}\n"
+        f"Ответов админов: {data['anonymous_replies']}\n"
+        f"Сработок антиспама: {data['anonymous_rate_limited']}\n\n"
+        f"Открытий гайдов: {data['guides_opened']}\n"
+        f"Скачиваний Тулы: {data['tula_downloads']}\n"
+        f"Уникальных скачавших Тулу: {data['tula_users']}\n\n"
+        f"Открытий соцсетей: {data['social_opened']}"
+    )
+
+
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("❓ Задать анонимный вопрос", callback_data="anon")],
@@ -145,6 +200,35 @@ def main_menu():
         [InlineKeyboardButton("📱 Социальные сети", callback_data="social")]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def admin_menu():
+    keyboard = [
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("🛠 Команды", callback_data="admin_help")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_message_to_admins(context, user_id, text, title):
+    keyboard = [
+        [InlineKeyboardButton("Ответить", callback_data=f"reply:{user_id}")]
+    ]
+    sent_count = 0
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"{title}\n\n{text}",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            sent_count += 1
+        except Exception as error:
+            print(f"ADMIN MESSAGE FAILED for {admin_id}: {error}")
+
+    return sent_count
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -190,11 +274,47 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Чтобы отменить ответ, отправь /cancel."
         )
 
+    elif query.data == "dialog_reply":
+        track_event(query.from_user.id, "anonymous_dialog_reply_started")
+        context.user_data["anon_dialog_mode"] = True
+        await query.message.reply_text(
+            "Напиши ответ — он уйдёт админам анонимно.\n\n"
+            "Чтобы отменить, отправь /cancel."
+        )
+
+    elif query.data == "admin_stats":
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        await query.message.reply_text(stats_text())
+
+    elif query.data == "admin_help":
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        await query.message.reply_text(
+            "🛠 Админ-команды\n\n"
+            "/admin — открыть админ-меню\n"
+            "/stats — показать статистику\n"
+            "/cancel — отменить текущий ответ или ввод вопроса\n\n"
+            "Чтобы ответить на анонимный вопрос, нажми кнопку "
+            "«Ответить» под сообщением с вопросом."
+        )
+
+    elif query.data == "main_menu":
+        await query.message.reply_text(
+            "Главное меню:",
+            reply_markup=main_menu()
+        )
+
     elif query.data == "anon":
         track_event(query.from_user.id, "anonymous_question_started")
         context.user_data["anon_mode"] = True
         await query.message.reply_text(
-            "Напиши свой вопрос — он будет отправлен анонимно."
+            "Напиши свой вопрос — он будет отправлен анонимно.\n\n"
+            "Чтобы отменить, отправь /cancel."
         )
 
     elif query.data == "guides":
@@ -274,7 +394,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"💌 Ответ на твой анонимный вопрос:\n\n{update.message.text}"
+                text=f"💌 Ответ на твой анонимный вопрос:\n\n{update.message.text}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "Ответить анонимно",
+                        callback_data="dialog_reply"
+                    )]
+                ])
             )
         except Exception as error:
             await update.message.reply_text(
@@ -286,25 +412,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         track_event(update.effective_user.id, "anonymous_reply")
         return
 
+    if context.user_data.get("anon_dialog_mode"):
+        wait_seconds = get_anon_wait_seconds(update.effective_user.id)
+
+        if wait_seconds:
+            track_event(update.effective_user.id, "anonymous_rate_limited")
+            await update.message.reply_text(
+                "Чтобы не было спама, анонимное сообщение можно отправлять "
+                f"раз в {format_wait_time(ANON_COOLDOWN_SECONDS)}.\n\n"
+                f"Попробуй ещё через {format_wait_time(wait_seconds)} "
+                "или отправь /cancel."
+            )
+            return
+
+        sent_count = await send_message_to_admins(
+            context,
+            update.effective_user.id,
+            update.message.text,
+            "💬 Продолжение анонимного диалога:"
+        )
+
+        if sent_count == 0:
+            await update.message.reply_text(
+                "Не получилось отправить сообщение админам. "
+                "Попробуй позже."
+            )
+            return
+
+        context.user_data["anon_dialog_mode"] = False
+        track_event(update.effective_user.id, "anonymous_dialog_reply")
+
+        await update.message.reply_text("Ответ отправлен анонимно ✅")
+        return
+
     if context.user_data.get("anon_mode"):
-        text = update.message.text
+        wait_seconds = get_anon_wait_seconds(update.effective_user.id)
 
-        keyboard = [
-            [InlineKeyboardButton(
-                "Ответить",
-                callback_data=f"reply:{update.effective_chat.id}"
-            )]
-        ]
+        if wait_seconds:
+            track_event(update.effective_user.id, "anonymous_rate_limited")
+            await update.message.reply_text(
+                "Чтобы не было спама, анонимный вопрос можно отправлять "
+                f"раз в {format_wait_time(ANON_COOLDOWN_SECONDS)}.\n\n"
+                f"Попробуй ещё через {format_wait_time(wait_seconds)} "
+                "или отправь /cancel."
+            )
+            return
 
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"❓ Анонимный вопрос:\n\n{text}",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-            except Exception as error:
-                print(f"ADMIN MESSAGE FAILED for {admin_id}: {error}")
+        sent_count = await send_message_to_admins(
+            context,
+            update.effective_user.id,
+            update.message.text,
+            "❓ Анонимный вопрос:"
+        )
+
+        if sent_count == 0:
+            await update.message.reply_text(
+                "Не получилось отправить вопрос админам. Попробуй позже."
+            )
+            return
 
         context.user_data["anon_mode"] = False
         track_event(update.effective_user.id, "anonymous_question")
@@ -321,18 +486,19 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Эта команда доступна только админу.")
         return
 
-    data = get_stats()
+    await update.message.reply_text(stats_text())
+
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update.effective_user)
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+
     await update.message.reply_text(
-        "📊 Статистика бота\n\n"
-        f"Пользователей: {data['users']}\n"
-        f"Активных сегодня (МСК): {data['active_today']}\n"
-        f"Запусков /start: {data['starts']}\n\n"
-        f"Анонимных вопросов: {data['anonymous_questions']}\n"
-        f"Ответов на вопросы: {data['anonymous_replies']}\n\n"
-        f"Открытий гайдов: {data['guides_opened']}\n"
-        f"Скачиваний Тулы: {data['tula_downloads']}\n"
-        f"Уникальных скачавших Тулу: {data['tula_users']}\n\n"
-        f"Открытий соцсетей: {data['social_opened']}"
+        "Админ-меню:",
+        reply_markup=admin_menu()
     )
 
 
@@ -340,6 +506,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user)
     context.user_data.pop("reply_to_user_id", None)
     context.user_data["anon_mode"] = False
+    context.user_data["anon_dialog_mode"] = False
 
     await update.message.reply_text("Действие отменено.")
 
@@ -349,6 +516,7 @@ init_db()
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("admin", admin))
 app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("cancel", cancel))
 app.add_handler(CallbackQueryHandler(buttons))
