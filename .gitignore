@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+bot_stats.db
+*.db-journal
