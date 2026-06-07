@@ -73,6 +73,14 @@ def init_db():
             )
         """)
         connection.execute("""
+            CREATE TABLE IF NOT EXISTS guide_waitlist (
+                user_id INTEGER NOT NULL,
+                city_key TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, city_key)
+            )
+        """)
+        connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_events_user_type_payload_created
             ON events (user_id, event_type, payload, created_at)
         """)
@@ -279,6 +287,60 @@ def save_guide(city_key, title, file_id):
         )
 
 
+def add_to_guide_waitlist(user_id, city_key):
+    with sqlite3.connect(DB_PATH) as connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO guide_waitlist (user_id, city_key)
+            VALUES (?, ?)
+            """,
+            (user_id, city_key)
+        )
+
+    return cursor.rowcount > 0
+
+
+def get_guide_waitlist_user_ids(city_key):
+    with sqlite3.connect(DB_PATH) as connection:
+        rows = connection.execute(
+            """
+            SELECT user_id
+            FROM guide_waitlist
+            WHERE city_key = ?
+            ORDER BY created_at
+            """,
+            (city_key,)
+        ).fetchall()
+
+    return [row[0] for row in rows]
+
+
+def clear_guide_waitlist(city_key):
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            "DELETE FROM guide_waitlist WHERE city_key = ?",
+            (city_key,)
+        )
+
+
+def get_waitlist_summary():
+    with sqlite3.connect(DB_PATH) as connection:
+        total = connection.execute(
+            "SELECT COUNT(*) FROM guide_waitlist"
+        ).fetchone()[0]
+        rows = connection.execute(
+            """
+            SELECT guides.title, COUNT(guide_waitlist.user_id)
+            FROM guide_waitlist
+            LEFT JOIN guides ON guides.city_key = guide_waitlist.city_key
+            GROUP BY guide_waitlist.city_key
+            ORDER BY COUNT(guide_waitlist.user_id) DESC
+            """
+        ).fetchall()
+
+    return total, rows
+
+
 def recent_questions(limit=10):
     with sqlite3.connect(DB_PATH) as connection:
         rows = connection.execute(
@@ -386,6 +448,13 @@ def format_wait_time(seconds):
 
 def stats_text():
     data = get_stats()
+    waitlist_total, waitlist_rows = get_waitlist_summary()
+    waitlist_lines = [
+        f"{title or 'Без названия'}: {count}"
+        for title, count in waitlist_rows
+    ]
+    waitlist_text = "\n".join(waitlist_lines) if waitlist_lines else "нет"
+
     return (
         "📊 Статистика бота\n\n"
         f"Пользователей: {data['users']}\n"
@@ -399,6 +468,8 @@ def stats_text():
         f"Открытий гайдов: {data['guides_opened']}\n"
         f"Скачиваний Тулы: {data['tula_downloads']}\n"
         f"Уникальных скачавших Тулу: {data['tula_users']}\n\n"
+        f"Ожидают будущие гайды: {waitlist_total}\n"
+        f"{waitlist_text}\n\n"
         f"Открытий соцсетей: {data['social_opened']}"
     )
 
@@ -698,7 +769,19 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not guide["is_available"] or not guide["file_id"]:
             track_event(query.from_user.id, "coming_soon_guide_clicked", city_key)
-            await query.message.reply_text("✨ Этот гайд скоро появится.")
+            keyboard = [
+                [InlineKeyboardButton(
+                    "🔔 Сообщить о выходе",
+                    callback_data=f"waitlist:{city_key}"
+                )],
+                [InlineKeyboardButton("🌍 Все гайды", callback_data="guides")]
+            ]
+
+            await query.message.reply_text(
+                f"✨ {guide['title']} скоро появится.\n\n"
+                "Можно нажать кнопку ниже — бот напишет тебе, когда гайд выйдет.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return
 
         track_event(query.from_user.id, "guide_download", city_key)
@@ -708,6 +791,26 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             document=guide["file_id"],
             caption=f"{guide['title']}"
         )
+
+    elif query.data.startswith("waitlist:"):
+        city_key = query.data.split(":", 1)[1]
+        guide = get_guide(city_key)
+
+        if not guide:
+            await query.message.reply_text("Этот гайд не найден.")
+            return
+
+        is_new = add_to_guide_waitlist(query.from_user.id, city_key)
+        track_event(query.from_user.id, "guide_waitlist_joined", city_key)
+
+        if is_new:
+            await query.message.reply_text(
+                f"Готово, я напишу тебе, когда выйдет {guide['title']} ✅"
+            )
+        else:
+            await query.message.reply_text(
+                f"Ты уже в списке ожидания: {guide['title']} ✅"
+            )
 
     elif query.data == "social":
         track_event(query.from_user.id, "social_opened")
@@ -906,10 +1009,13 @@ async def add_guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city_key, title = parts
     city_key = city_key.lower().strip()
 
-    if not city_key.replace("_", "").replace("-", "").isalnum():
+    if (
+        len(city_key) > 40
+        or not city_key.replace("_", "").replace("-", "").isalnum()
+    ):
         await update.message.reply_text(
-            "city_key должен состоять из латинских букв, цифр, "
-            "дефиса или подчёркивания."
+            "city_key должен быть до 40 символов и состоять из "
+            "латинских букв, цифр, дефиса или подчёркивания."
         )
         return
 
@@ -961,10 +1067,44 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_guide["city_key"]
     )
 
+    waitlist_user_ids = get_guide_waitlist_user_ids(pending_guide["city_key"])
+    notified_count = 0
+    failed_count = 0
+
+    for user_id in waitlist_user_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"✨ Гайд {pending_guide['title']} уже в боте!\n\n"
+                    "Открой раздел «Получить гайды» и забирай его."
+                ),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🌍 Получить гайды", callback_data="guides")]
+                ])
+            )
+            notified_count += 1
+        except Exception as error:
+            failed_count += 1
+            print(f"GUIDE WAITLIST NOTIFY FAILED for {user_id}: {error}")
+
+    if waitlist_user_ids:
+        clear_guide_waitlist(pending_guide["city_key"])
+        track_event(
+            update.effective_user.id,
+            "guide_waitlist_notified",
+            (
+                f"{pending_guide['city_key']};"
+                f"sent={notified_count};failed={failed_count}"
+            )
+        )
+
     await update.message.reply_text(
         "Гайд сохранён ✅\n\n"
         f"Город: {pending_guide['title']}\n"
-        f"Ключ: {pending_guide['city_key']}"
+        f"Ключ: {pending_guide['city_key']}\n"
+        f"Уведомлено ожидающих: {notified_count}\n"
+        f"Ошибок уведомления: {failed_count}"
     )
 
 
