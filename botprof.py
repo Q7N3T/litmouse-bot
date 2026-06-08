@@ -81,6 +81,17 @@ def init_db():
             )
         """)
         connection.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                rating INTEGER NOT NULL,
+                review_text TEXT NOT NULL,
+                show_username INTEGER NOT NULL DEFAULT 0,
+                display_name TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_events_user_type_payload_created
             ON events (user_id, event_type, payload, created_at)
         """)
@@ -361,6 +372,67 @@ def recent_questions(limit=10):
     return rows
 
 
+def save_feedback(user_id, rating, review_text, show_username, display_name=None):
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            INSERT INTO feedback (
+                user_id,
+                rating,
+                review_text,
+                show_username,
+                display_name
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                rating,
+                review_text,
+                int(show_username),
+                display_name if show_username else None,
+            )
+        )
+
+
+def get_feedback_stats():
+    with sqlite3.connect(DB_PATH) as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*), AVG(rating)
+            FROM feedback
+            """
+        ).fetchone()
+        rating_rows = connection.execute(
+            """
+            SELECT rating, COUNT(*)
+            FROM feedback
+            GROUP BY rating
+            ORDER BY rating DESC
+            """
+        ).fetchall()
+
+    total = row[0] or 0
+    average = row[1] or 0
+    distribution = {rating: count for rating, count in rating_rows}
+    return total, average, distribution
+
+
+def recent_feedback(limit=10):
+    with sqlite3.connect(DB_PATH) as connection:
+        rows = connection.execute(
+            """
+            SELECT rating, review_text, show_username, display_name, created_at
+            FROM feedback
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+    return rows
+
+
 def count_events(connection, event_type, payload=None):
     if payload is None:
         return connection.execute(
@@ -449,6 +521,7 @@ def format_wait_time(seconds):
 def stats_text():
     data = get_stats()
     waitlist_total, waitlist_rows = get_waitlist_summary()
+    feedback_total, feedback_average, _ = get_feedback_stats()
     waitlist_lines = [
         f"{title or 'Без названия'}: {count}"
         for title, count in waitlist_rows
@@ -470,6 +543,8 @@ def stats_text():
         f"Уникальных скачавших Тулу: {data['tula_users']}\n\n"
         f"Ожидают будущие гайды: {waitlist_total}\n"
         f"{waitlist_text}\n\n"
+        f"Отзывов: {feedback_total}\n"
+        f"Средняя оценка: {feedback_average:.2f}/5\n\n"
         f"Открытий соцсетей: {data['social_opened']}"
     )
 
@@ -496,10 +571,56 @@ def questions_text():
     return "\n".join(lines)
 
 
+def feedback_text():
+    total, average, distribution = get_feedback_stats()
+    rows = recent_feedback()
+
+    if total == 0:
+        return "Пока нет отзывов."
+
+    lines = [
+        "⭐ Отзывы о боте\n",
+        f"Всего отзывов: {total}",
+        f"Средняя оценка: {average:.2f}/5",
+        "",
+        "Оценки:"
+    ]
+
+    for rating in range(5, 0, -1):
+        lines.append(f"{rating}⭐: {distribution.get(rating, 0)}")
+
+    lines.append("\nПоследние отзывы:")
+
+    for index, (rating, review_text, show_username, display_name, created_at) in enumerate(
+        rows,
+        start=1
+    ):
+        author = display_name if show_username and display_name else "анонимно"
+        text = review_text.strip()
+        if len(text) > 300:
+            text = f"{text[:300]}..."
+
+        lines.append(
+            f"\n{index}. {rating}⭐ · {author} · {created_at}\n{text}"
+        )
+
+    return "\n".join(lines)
+
+
+def user_display_name(user):
+    if user.username:
+        return f"@{user.username}"
+
+    name_parts = [user.first_name, user.last_name]
+    name = " ".join(part for part in name_parts if part)
+    return name or "пользователь Telegram"
+
+
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("❓ Задать анонимный вопрос", callback_data="anon")],
         [InlineKeyboardButton("🌍 Получить гайды", callback_data="guides")],
+        [InlineKeyboardButton("⭐ Оставить отзыв", callback_data="feedback_start")],
         [InlineKeyboardButton("📱 Социальные сети", callback_data="social")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -510,6 +631,7 @@ def admin_menu():
         [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton("🗂 Гайды", callback_data="admin_guides_help")],
         [InlineKeyboardButton("❓ Вопросы", callback_data="admin_questions")],
+        [InlineKeyboardButton("⭐ Отзывы", callback_data="admin_feedback")],
         [InlineKeyboardButton("📣 Рассылка", callback_data="admin_broadcast_help")],
         [InlineKeyboardButton("🛠 Команды", callback_data="admin_help")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
@@ -532,6 +654,25 @@ def guides_menu():
             )
         ])
 
+    return InlineKeyboardMarkup(keyboard)
+
+
+def feedback_rating_menu():
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{rating}⭐", callback_data=f"feedback_rating:{rating}")
+            for rating in range(1, 6)
+        ],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def feedback_privacy_menu():
+    keyboard = [
+        [InlineKeyboardButton("Анонимно", callback_data="feedback_privacy:anon")],
+        [InlineKeyboardButton("Оставить ник", callback_data="feedback_privacy:nick")]
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -655,6 +796,13 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(questions_text())
 
+    elif query.data == "admin_feedback":
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        await query.message.reply_text(feedback_text())
+
     elif query.data == "broadcast_confirm":
         if not is_admin(query.from_user.id):
             await query.message.reply_text("Эта кнопка доступна только админу.")
@@ -711,6 +859,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/broadcast текст — сделать рассылку всем пользователям\n"
             "/addguide city_key Название — добавить или заменить гайд\n"
             "/questions — последние анонимные вопросы\n"
+            "/feedback — отзывы и средняя оценка\n"
             "/cancel — отменить текущий ответ или ввод вопроса\n\n"
             "Чтобы ответить на анонимный вопрос, нажми кнопку "
             "«Ответить» под сообщением с вопросом."
@@ -728,6 +877,77 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "Напиши свой вопрос — он будет отправлен анонимно.\n\n"
             "Чтобы отменить, отправь /cancel."
+        )
+
+    elif query.data == "feedback_start":
+        track_event(query.from_user.id, "feedback_started")
+        context.user_data["pending_feedback"] = {}
+        context.user_data["feedback_text_mode"] = False
+        await query.message.reply_text(
+            "Спасибо, что хочешь оставить отзыв.\n\n"
+            "Сначала поставь оценку боту:",
+            reply_markup=feedback_rating_menu()
+        )
+
+    elif query.data.startswith("feedback_rating:"):
+        rating = int(query.data.split(":", 1)[1])
+        context.user_data["pending_feedback"] = {"rating": rating}
+        context.user_data["feedback_text_mode"] = True
+        track_event(query.from_user.id, "feedback_rating_selected", str(rating))
+        await query.message.reply_text(
+            f"Оценка: {rating}⭐\n\n"
+            "Теперь напиши отзыв одним сообщением.\n\n"
+            "По умолчанию он будет анонимным. После текста можно будет "
+            "выбрать, оставить ник или нет."
+        )
+
+    elif query.data.startswith("feedback_privacy:"):
+        pending_feedback = context.user_data.get("pending_feedback")
+        if not pending_feedback or not pending_feedback.get("review_text"):
+            await query.message.reply_text(
+                "Черновик отзыва не найден. Начни заново через кнопку «Оставить отзыв»."
+            )
+            return
+
+        privacy = query.data.split(":", 1)[1]
+        show_username = privacy == "nick"
+        display_name = user_display_name(query.from_user) if show_username else None
+        rating = pending_feedback["rating"]
+        review_text = pending_feedback["review_text"]
+
+        save_feedback(
+            query.from_user.id,
+            rating,
+            review_text,
+            show_username,
+            display_name
+        )
+        track_event(
+            query.from_user.id,
+            "feedback_submitted",
+            f"rating={rating};show_username={int(show_username)}"
+        )
+        context.user_data.pop("pending_feedback", None)
+        context.user_data["feedback_text_mode"] = False
+
+        author = display_name if show_username else "анонимно"
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "⭐ Новый отзыв о боте\n\n"
+                        f"Оценка: {rating}/5\n"
+                        f"Автор: {author}\n\n"
+                        f"{review_text}"
+                    )
+                )
+            except Exception as error:
+                print(f"FEEDBACK ADMIN MESSAGE FAILED for {admin_id}: {error}")
+
+        await query.message.reply_text(
+            "Спасибо, отзыв сохранён ✅",
+            reply_markup=main_menu()
         )
 
     elif query.data == "guides":
@@ -854,6 +1074,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("Ответ отправлен ✅")
         track_event(update.effective_user.id, "anonymous_reply")
+        return
+
+    if context.user_data.get("feedback_text_mode"):
+        pending_feedback = context.user_data.get("pending_feedback")
+        if not pending_feedback or not pending_feedback.get("rating"):
+            context.user_data["feedback_text_mode"] = False
+            await update.message.reply_text(
+                "Оценка не найдена. Начни заново через кнопку «Оставить отзыв»."
+            )
+            return
+
+        review_text = update.message.text.strip()
+        if not review_text:
+            await update.message.reply_text(
+                "Отзыв не может быть пустым. Напиши пару слов и отправь ещё раз."
+            )
+            return
+
+        if len(review_text) > 1200:
+            await update.message.reply_text(
+                "Отзыв получился длиннее 1200 символов. "
+                "Сократи его, пожалуйста, и отправь ещё раз."
+            )
+            return
+
+        pending_feedback["review_text"] = review_text
+        context.user_data["feedback_text_mode"] = False
+        track_event(update.effective_user.id, "feedback_text_added")
+        await update.message.reply_text(
+            "Как сохранить отзыв?",
+            reply_markup=feedback_privacy_menu()
+        )
         return
 
     if context.user_data.get("anon_dialog_mode"):
@@ -1040,6 +1292,16 @@ async def questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(questions_text())
 
 
+async def feedback_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update.effective_user)
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только админу.")
+        return
+
+    await update.message.reply_text(feedback_text())
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user)
 
@@ -1113,6 +1375,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("reply_to_user_id", None)
     context.user_data.pop("broadcast_text", None)
     context.user_data.pop("pending_guide", None)
+    context.user_data.pop("pending_feedback", None)
+    context.user_data["feedback_text_mode"] = False
     context.user_data["anon_mode"] = False
     context.user_data["anon_dialog_mode"] = False
 
@@ -1129,6 +1393,7 @@ app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CommandHandler("addguide", add_guide))
 app.add_handler(CommandHandler("questions", questions))
+app.add_handler(CommandHandler("feedback", feedback_report))
 app.add_handler(CommandHandler("cancel", cancel))
 app.add_handler(CallbackQueryHandler(buttons))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
