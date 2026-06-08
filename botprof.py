@@ -410,7 +410,6 @@ def get_stats():
             "guides_opened": count_events(connection, "guides_opened"),
             "tula_downloads": count_events(connection, "guide_download", "tula"),
             "tula_users": tula_users,
-            "trip_plans": count_events(connection, "trip_plan_completed"),
             "social_opened": count_events(connection, "social_opened"),
         }
 
@@ -471,7 +470,6 @@ def stats_text():
         f"Уникальных скачавших Тулу: {data['tula_users']}\n\n"
         f"Ожидают будущие гайды: {waitlist_total}\n"
         f"{waitlist_text}\n\n"
-        f"Подборов маршрута: {data['trip_plans']}\n\n"
         f"Открытий соцсетей: {data['social_opened']}"
     )
 
@@ -500,7 +498,6 @@ def questions_text():
 
 def main_menu():
     keyboard = [
-        [InlineKeyboardButton("🧭 Подобрать маршрут", callback_data="trip_start")],
         [InlineKeyboardButton("❓ Задать анонимный вопрос", callback_data="anon")],
         [InlineKeyboardButton("🌍 Получить гайды", callback_data="guides")],
         [InlineKeyboardButton("📱 Социальные сети", callback_data="social")]
@@ -536,102 +533,6 @@ def guides_menu():
         ])
 
     return InlineKeyboardMarkup(keyboard)
-
-
-def trip_days_menu():
-    keyboard = [
-        [InlineKeyboardButton("⚡️ 1 день", callback_data="trip_days:one")],
-        [InlineKeyboardButton("🌙 Уикенд", callback_data="trip_days:weekend")],
-        [InlineKeyboardButton("🧳 3 дня", callback_data="trip_days:three")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def trip_vibe_menu():
-    keyboard = [
-        [InlineKeyboardButton("📸 Красивые места", callback_data="trip_vibe:photo")],
-        [InlineKeyboardButton("🍰 Еда и кофе", callback_data="trip_vibe:food")],
-        [InlineKeyboardButton("🏛 Культура", callback_data="trip_vibe:culture")],
-        [InlineKeyboardButton("🌿 Спокойно погулять", callback_data="trip_vibe:slow")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def trip_budget_menu():
-    keyboard = [
-        [InlineKeyboardButton("💸 Бережно", callback_data="trip_budget:easy")],
-        [InlineKeyboardButton("✨ Комфортно", callback_data="trip_budget:comfort")],
-        [InlineKeyboardButton("🥂 Красиво", callback_data="trip_budget:wow")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def build_trip_plan_text(plan):
-    days_titles = {
-        "one": "1 день",
-        "weekend": "уикенд",
-        "three": "3 дня"
-    }
-    vibe_titles = {
-        "photo": "красивые места",
-        "food": "еда и кофе",
-        "culture": "культура",
-        "slow": "спокойная прогулка"
-    }
-    budget_titles = {
-        "easy": "бережно",
-        "comfort": "комфортно",
-        "wow": "красиво"
-    }
-    vibe_routes = {
-        "photo": (
-            "утро: Тульский кремль и центр, пока мало людей\n"
-            "день: набережная, красивые дворы и точка для фото-паузы\n"
-            "вечер: мягкий свет, прогулка без спешки и красивый финал"
-        ),
-        "food": (
-            "утро: кофе и завтрак в центре\n"
-            "день: прогулка с остановками на десерт и локальные вкусы\n"
-            "вечер: ужин без суеты и маленький сувенир домой"
-        ),
-        "culture": (
-            "утро: кремль и исторический центр\n"
-            "день: музейный блок, городские детали и понятный темп\n"
-            "вечер: спокойная прогулка, чтобы всё уложилось в голове"
-        ),
-        "slow": (
-            "утро: поздний старт, кофе и короткая прогулка\n"
-            "день: 2-3 точки без гонки по списку\n"
-            "вечер: место, где можно просто выдохнуть и не смотреть на часы"
-        )
-    }
-    day_notes = {
-        "one": "держи маршрут компактным: 3-4 точки и один главный акцент",
-        "weekend": "раздели поездку на активный день и мягкое утро",
-        "three": "оставь третий день под любимые места, покупки и возвращение"
-    }
-    budget_notes = {
-        "easy": "больше прогулок, одна главная платная точка и без лишних такси",
-        "comfort": "добавь хороший завтрак, одну активность и спокойный ужин",
-        "wow": "заложи красивый ресторан, такси между дальними точками и сувениры"
-    }
-
-    days = plan.get("days", "weekend")
-    vibe = plan.get("vibe", "slow")
-    budget = plan.get("budget", "comfort")
-
-    return (
-        "🧭 Твой litmouse-маршрут по Туле\n\n"
-        f"Формат: {days_titles[days]}\n"
-        f"Вайб: {vibe_titles[vibe]}\n"
-        f"Бюджет: {budget_titles[budget]}\n\n"
-        f"{vibe_routes[vibe]}\n\n"
-        f"Как ехать: {day_notes[days]}.\n"
-        f"По деньгам: {budget_notes[budget]}.\n\n"
-        "А подробные адреса, порядок точек и маленькие нюансы лучше забрать "
-        "в гайде — так маршрут не развалится на месте."
-    )
 
 
 async def send_message_to_admins(context, user_id, text, title):
@@ -827,55 +728,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "Напиши свой вопрос — он будет отправлен анонимно.\n\n"
             "Чтобы отменить, отправь /cancel."
-        )
-
-    elif query.data == "trip_start":
-        track_event(query.from_user.id, "trip_plan_started")
-        context.user_data["trip_plan"] = {}
-        await query.message.reply_text(
-            "Соберу тебе маршрут по Туле под настроение.\n\n"
-            "Сколько времени есть на поездку?",
-            reply_markup=trip_days_menu()
-        )
-
-    elif query.data.startswith("trip_days:"):
-        days = query.data.split(":", 1)[1]
-        context.user_data["trip_plan"] = {"days": days}
-        track_event(query.from_user.id, "trip_plan_days", days)
-        await query.message.reply_text(
-            "Какой вайб хочется?",
-            reply_markup=trip_vibe_menu()
-        )
-
-    elif query.data.startswith("trip_vibe:"):
-        vibe = query.data.split(":", 1)[1]
-        trip_plan = context.user_data.setdefault("trip_plan", {})
-        trip_plan["vibe"] = vibe
-        track_event(query.from_user.id, "trip_plan_vibe", vibe)
-        await query.message.reply_text(
-            "И какой бюджет по ощущениям?",
-            reply_markup=trip_budget_menu()
-        )
-
-    elif query.data.startswith("trip_budget:"):
-        budget = query.data.split(":", 1)[1]
-        trip_plan = context.user_data.setdefault("trip_plan", {})
-        trip_plan["budget"] = budget
-        text = build_trip_plan_text(trip_plan)
-        payload = (
-            f"days={trip_plan.get('days', 'weekend')};"
-            f"vibe={trip_plan.get('vibe', 'slow')};"
-            f"budget={budget}"
-        )
-        track_event(query.from_user.id, "trip_plan_completed", payload)
-        keyboard = [
-            [InlineKeyboardButton("🌍 Забрать подробный гайд", callback_data="guides")],
-            [InlineKeyboardButton("🧭 Подобрать заново", callback_data="trip_start")],
-            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-        ]
-        await query.message.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
     elif query.data == "guides":
@@ -1261,7 +1113,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("reply_to_user_id", None)
     context.user_data.pop("broadcast_text", None)
     context.user_data.pop("pending_guide", None)
-    context.user_data.pop("trip_plan", None)
     context.user_data["anon_mode"] = False
     context.user_data["anon_dialog_mode"] = False
 
