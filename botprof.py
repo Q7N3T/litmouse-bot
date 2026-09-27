@@ -92,6 +92,17 @@ def init_db():
             )
         """)
         connection.execute("""
+            CREATE TABLE IF NOT EXISTS anon_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                question_text TEXT NOT NULL,
+                answer_text TEXT,
+                channel_message_id INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                published_at TEXT
+            )
+        """)
+        connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_events_user_type_payload_created
             ON events (user_id, event_type, payload, created_at)
         """)
@@ -370,6 +381,47 @@ def recent_questions(limit=10):
         ).fetchall()
 
     return rows
+
+
+def save_anon_question(user_id, question_text):
+    with sqlite3.connect(DB_PATH) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO anon_questions (user_id, question_text)
+            VALUES (?, ?)
+            """,
+            (user_id, question_text)
+        )
+        return cursor.lastrowid
+
+
+def get_anon_question(question_id):
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT id, user_id, question_text, channel_message_id
+            FROM anon_questions
+            WHERE id = ?
+            """,
+            (question_id,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def mark_anon_question_published(question_id, answer_text, channel_message_id):
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            UPDATE anon_questions
+            SET answer_text = ?,
+                channel_message_id = ?,
+                published_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (answer_text, channel_message_id, question_id)
+        )
 
 
 def save_feedback(user_id, rating, review_text, show_username, display_name=None):
@@ -676,10 +728,61 @@ def feedback_privacy_menu():
     return InlineKeyboardMarkup(keyboard)
 
 
-async def send_message_to_admins(context, user_id, text, title):
+def channel_post_text(question_text, answer_text):
+    return (
+        "❓ Анонимный вопрос:\n\n"
+        f"{question_text}\n\n"
+        "💬 Ответ:\n\n"
+        f"{answer_text}"
+    )
+
+
+def channel_post_link(channel_message_id):
+    return f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}/{channel_message_id}"
+
+
+def ask_question_keyboard(bot_username):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "❓ Задать свой вопрос анонимно",
+            url=f"https://t.me/{bot_username}?start=ask"
+        )]
+    ])
+
+
+def publish_preview_menu():
+    keyboard = [
+        [InlineKeyboardButton("📣 Опубликовать в канал", callback_data="publish_confirm")],
+        [InlineKeyboardButton("✉️ Только ответить лично", callback_data="publish_private")],
+        [InlineKeyboardButton("✖️ Отмена", callback_data="publish_cancel")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_anon_answer(context, user_id, answer_text):
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"💌 Ответ на твой анонимный вопрос:\n\n{answer_text}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "Ответить анонимно",
+                callback_data="dialog_reply"
+            )]
+        ])
+    )
+
+
+async def send_message_to_admins(context, user_id, text, title, question_id=None):
     keyboard = [
         [InlineKeyboardButton("Ответить", callback_data=f"reply:{user_id}")]
     ]
+    if question_id:
+        keyboard.append([
+            InlineKeyboardButton(
+                "📣 Ответить и опубликовать",
+                callback_data=f"reply_pub:{question_id}"
+            )
+        ])
     sent_count = 0
 
     for admin_id in ADMIN_IDS:
@@ -704,6 +807,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     track_event(update.effective_user.id, "start")
+
+    if context.args and context.args[0] == "ask":
+        track_event(update.effective_user.id, "anonymous_question_started", "channel_link")
+        context.user_data["anon_mode"] = True
+        await update.message.reply_text(
+            "Напиши свой вопрос — он будет отправлен анонимно.\n\n"
+            "Чтобы отменить, отправь /cancel."
+        )
+        return
 
     with open("navigation.jpg", "rb") as photo:
         await update.message.reply_photo(
@@ -742,11 +854,119 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         user_id = int(query.data.split(":", 1)[1])
+        context.user_data.pop("publish_question_id", None)
         context.user_data["reply_to_user_id"] = user_id
         await query.message.reply_text(
             "Напиши ответ — бот отправит его пользователю анонимно.\n\n"
             "Чтобы отменить ответ, отправь /cancel."
         )
+
+    elif query.data.startswith("reply_pub:"):
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        question_id = int(query.data.split(":", 1)[1])
+        question = get_anon_question(question_id)
+
+        if not question:
+            await query.message.reply_text("Вопрос не найден в базе.")
+            return
+
+        if question["channel_message_id"]:
+            await query.message.reply_text(
+                "Этот вопрос уже опубликован:\n"
+                f"{channel_post_link(question['channel_message_id'])}"
+            )
+            return
+
+        context.user_data.pop("reply_to_user_id", None)
+        context.user_data.pop("pending_publish", None)
+        context.user_data["publish_question_id"] = question_id
+        await query.message.reply_text(
+            "Напиши ответ. Перед публикацией я покажу, как будет выглядеть пост.\n\n"
+            "Чтобы отменить, отправь /cancel."
+        )
+
+    elif query.data in ("publish_confirm", "publish_private", "publish_cancel"):
+        if not is_admin(query.from_user.id):
+            await query.message.reply_text("Эта кнопка доступна только админу.")
+            return
+
+        pending = context.user_data.pop("pending_publish", None)
+        await query.edit_message_reply_markup(reply_markup=None)
+
+        if not pending:
+            await query.message.reply_text("Нет ответа, ожидающего публикации.")
+            return
+
+        if query.data == "publish_cancel":
+            await query.message.reply_text("Публикация отменена. Ответ не отправлен.")
+            return
+
+        question = get_anon_question(pending["question_id"])
+        if not question:
+            await query.message.reply_text("Вопрос не найден в базе.")
+            return
+
+        if question["channel_message_id"]:
+            await query.message.reply_text(
+                "Этот вопрос уже опубликован другим админом:\n"
+                f"{channel_post_link(question['channel_message_id'])}"
+            )
+            return
+
+        channel_message = None
+        if query.data == "publish_confirm":
+            try:
+                channel_message = await context.bot.send_message(
+                    chat_id=CHANNEL_USERNAME,
+                    text=channel_post_text(
+                        question["question_text"],
+                        pending["answer_text"]
+                    ),
+                    reply_markup=ask_question_keyboard(context.bot.username)
+                )
+            except Exception as error:
+                context.user_data["pending_publish"] = pending
+                await query.message.reply_text(
+                    f"Не получилось опубликовать в {CHANNEL_USERNAME}: {error}\n\n"
+                    "Проверь, что бот — админ канала с правом публикации.",
+                    reply_markup=publish_preview_menu()
+                )
+                return
+
+            mark_anon_question_published(
+                question["id"],
+                pending["answer_text"],
+                channel_message.message_id
+            )
+            track_event(query.from_user.id, "anonymous_answer_published", str(question["id"]))
+
+        try:
+            await send_anon_answer(context, question["user_id"], pending["answer_text"])
+            if channel_message:
+                await context.bot.send_message(
+                    chat_id=question["user_id"],
+                    text=(
+                        "📣 Твой вопрос попал в канал — анонимно, без имени:\n"
+                        f"{channel_post_link(channel_message.message_id)}"
+                    )
+                )
+        except Exception as error:
+            await query.message.reply_text(
+                f"Не получилось отправить ответ пользователю: {error}"
+            )
+        else:
+            track_event(query.from_user.id, "anonymous_reply")
+
+        if channel_message:
+            await query.message.reply_text(
+                "Опубликовано ✅\n"
+                f"{channel_post_link(channel_message.message_id)}"
+            )
+        else:
+            await query.message.reply_text("Ответ отправлен лично ✅")
 
     elif query.data == "dialog_reply":
         track_event(query.from_user.id, "anonymous_dialog_reply_started")
@@ -1056,16 +1276,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = context.user_data.pop("reply_to_user_id")
 
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"💌 Ответ на твой анонимный вопрос:\n\n{update.message.text}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "Ответить анонимно",
-                        callback_data="dialog_reply"
-                    )]
-                ])
-            )
+            await send_anon_answer(context, user_id, update.message.text)
         except Exception as error:
             await update.message.reply_text(
                 f"Не получилось отправить ответ: {error}"
@@ -1074,6 +1285,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("Ответ отправлен ✅")
         track_event(update.effective_user.id, "anonymous_reply")
+        return
+
+    if (
+        is_admin(update.effective_user.id)
+        and context.user_data.get("publish_question_id")
+    ):
+        question_id = context.user_data.pop("publish_question_id")
+        question = get_anon_question(question_id)
+
+        if not question:
+            await update.message.reply_text("Вопрос не найден в базе.")
+            return
+
+        post_text = channel_post_text(question["question_text"], update.message.text)
+        if len(post_text) > 4000:
+            context.user_data["publish_question_id"] = question_id
+            await update.message.reply_text(
+                "Пост получается длиннее лимита Telegram (4096 символов). "
+                "Сократи ответ и отправь ещё раз или /cancel."
+            )
+            return
+
+        context.user_data["pending_publish"] = {
+            "question_id": question_id,
+            "answer_text": update.message.text,
+        }
+        await update.message.reply_text(
+            "Так пост будет выглядеть в канале:\n\n"
+            "———\n"
+            f"{post_text}\n"
+            "———\n\n"
+            "Под постом будет кнопка «❓ Задать свой вопрос анонимно». "
+            "Пользователь получит ответ лично и ссылку на пост.",
+            reply_markup=publish_preview_menu()
+        )
         return
 
     if context.user_data.get("feedback_text_mode"):
@@ -1158,11 +1404,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        question_id = save_anon_question(
+            update.effective_user.id,
+            update.message.text
+        )
         sent_count = await send_message_to_admins(
             context,
             update.effective_user.id,
             update.message.text,
-            "❓ Анонимный вопрос:"
+            "❓ Анонимный вопрос:",
+            question_id=question_id
         )
 
         if sent_count == 0:
@@ -1373,6 +1624,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update.effective_user)
     context.user_data.pop("reply_to_user_id", None)
+    context.user_data.pop("publish_question_id", None)
+    context.user_data.pop("pending_publish", None)
     context.user_data.pop("broadcast_text", None)
     context.user_data.pop("pending_guide", None)
     context.user_data.pop("pending_feedback", None)
